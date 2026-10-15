@@ -44,27 +44,18 @@ impl<'clust> Cluster<'clust> {
             return;
         }
 
-        let mut tmp;
+        let mut sum = [0u64; 4];
+        let mut weight = 0u64;
 
         for e in self.entries.iter() {
-            let weight = e.weight as f32;
-
-            tmp = [
-                e.color[0] as f32,
-                e.color[1] as f32,
-                e.color[2] as f32,
-                e.color[3] as f32,
-            ];
-            add_color(&mut self.mean, &tmp, weight);
-
-            self.weight += weight;
+            add_weighted(&mut sum, &e.color, e.weight);
+            weight += u64::from(e.weight);
         }
 
-        self.mean[0] /= self.weight;
-        self.mean[1] /= self.weight;
-        self.mean[2] /= self.weight;
-        self.mean[3] /= self.weight;
+        self.mean = weighted_mean(&sum, weight);
+        self.weight = weight as f32;
 
+        let mut tmp;
         let mut diff_sum: [f32; 4] = [0f32; 4];
 
         for &e in self.entries.iter() {
@@ -143,20 +134,13 @@ impl<'clust> Cluster<'clust> {
     fn split(&mut self) -> (Self, Self) {
         let widest_chan = self.widest_chan as usize;
 
-        // The f32 mean can land just outside the channel's values (e.g. 254.99998 when they are
-        // all 255), which would put every entry on the same side. Keep the pivot within them.
-        let (min, max) = self
-            .entries
-            .iter()
-            .fold((u8::MAX, u8::MIN), |(min, max), e| {
-                let v = e.color[widest_chan];
-                (min.min(v), max.max(v))
-            });
-        let widest_chan_mean = self.mean[widest_chan].clamp(min as f32, max as f32);
+        // Exact (see `weighted_mean`), so it lies within the channel's values and both halves get
+        // entries whenever they differ.
+        let widest_chan_mean = self.mean[widest_chan];
 
         let mut i: usize = 0;
         let mut lt: usize = 0;
-        // Exclusive upper bound, so it never goes below zero.
+        // Exclusive upper bound, so it never goes below zero even if every entry is above the mean.
         let mut gt: usize = self.entries.len();
 
         let mut lt_weight: usize = 0;
@@ -193,50 +177,29 @@ impl<'clust> Cluster<'clust> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Adds `color * weight` to `sum`. Integer sums are exact, unlike f32 ones, which round once
+/// they pass 2^24 (one colour covering ~66k pixels).
 #[inline(always)]
-fn add_color(dst: &mut [f32; 4], src: &[f32; 4], weight: f32) {
-    unsafe {
-        use std::arch::x86_64::*;
-
-        let mut psrc = _mm_loadu_ps(src.as_ptr());
-        let mut pdst = _mm_loadu_ps(dst.as_ptr());
-        let pweights = _mm_set1_ps(weight);
-
-        psrc = _mm_mul_ps(psrc, pweights);
-        pdst = _mm_add_ps(pdst, psrc);
-
-        _mm_storeu_ps(dst.as_mut_ptr(), pdst);
-    }
+pub(crate) fn add_weighted(sum: &mut [u64; 4], color: &[u8; 4], weight: u32) {
+    let weight = u64::from(weight);
+    sum[0] += u64::from(color[0]) * weight;
+    sum[1] += u64::from(color[1]) * weight;
+    sum[2] += u64::from(color[2]) * weight;
+    sum[3] += u64::from(color[3]) * weight;
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+/// The mean of exact weighted sums. Below 2^45 pixels both convert to f64 without rounding, so the
+/// result is the correctly rounded mean: within the summed values, and equal to them when they are
+/// all the same.
 #[inline(always)]
-fn add_color(dst: &mut [f32; 4], src: &[f32; 4], weight: f32) {
-    unsafe {
-        use std::arch::aarch64::*;
-
-        let mut psrc = vld1q_f32(src.as_ptr());
-        let mut pdst = vld1q_f32(dst.as_ptr());
-        let pweights = vmovq_n_f32(weight);
-
-        psrc = vmulq_f32(psrc, pweights);
-        pdst = vaddq_f32(pdst, psrc);
-
-        vst1q_f32(dst.as_mut_ptr(), pdst);
-    }
-}
-
-#[cfg(not(any(
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
-#[inline(always)]
-fn add_color(dst: &mut [f32; 4], src: &[f32; 4], weight: f32) {
-    dst[0] += src[0] * weight;
-    dst[1] += src[1] * weight;
-    dst[2] += src[2] * weight;
-    dst[3] += src[3] * weight;
+pub(crate) fn weighted_mean(sum: &[u64; 4], weight: u64) -> [f32; 4] {
+    let weight = weight as f64;
+    [
+        (sum[0] as f64 / weight) as f32,
+        (sum[1] as f64 / weight) as f32,
+        (sum[2] as f64 / weight) as f32,
+        (sum[3] as f64 / weight) as f32,
+    ]
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -298,6 +261,7 @@ fn add_diff(dst: &mut [f32; 4], a: &[f32; 4], b: &[f32; 4], weight: f32) {
 
 #[cfg(test)]
 mod tests {
+    use super::Cluster;
     use crate::histogram::{Histogram, HistogramEntry};
     use crate::{Options, QuantizeResult};
 
@@ -321,6 +285,28 @@ mod tests {
             .count;
         assert!((1..=max_colors as usize).contains(&(count as usize)));
         count as usize
+    }
+
+    // Every mean lies within the values it averages, and equals them when they are all the same.
+    fn assert_means_within_values(clusters: &[Cluster]) {
+        for c in clusters {
+            for ch in 0..4 {
+                let (min, max) = c.entries.iter().fold((u8::MAX, u8::MIN), |(min, max), e| {
+                    (min.min(e.color[ch]), max.max(e.color[ch]))
+                });
+                let mean = c.mean[ch];
+                assert!(
+                    (min as f32..=max as f32).contains(&mean),
+                    "channel {ch} mean {mean} outside {min}..={max}"
+                );
+                if min == max {
+                    assert_eq!(mean, min as f32, "channel {ch} mean of equal values");
+                }
+            }
+            if c.entries.iter().all(|e| e.color == c.entries[0].color) {
+                assert_eq!(c.chan_diff, 0.0);
+            }
+        }
     }
 
     // A 512x512 map tile that is one colour plus 17 antialiasing shades. Summed in f32, the alpha
@@ -379,5 +365,97 @@ mod tests {
             let max_colors = [2, 4, 16, 128, 256][rand(5) as usize];
             quantize(&histogram(&colors), max_colors);
         }
+    }
+
+    // The same kind of tile rendered at 2x, 4x and 8x (1024x1024 up to 4096x4096 pixels): one
+    // colour covers millions of pixels, so f32 sums would round by several units.
+    #[test]
+    fn near_uniform_large_images() {
+        let shades: [([u8; 4], u32); 5] = [
+            ([251, 248, 243, 255], 193),
+            ([249, 244, 237, 255], 6),
+            ([250, 247, 242, 255], 4),
+            ([250, 246, 239, 255], 2),
+            ([251, 248, 242, 255], 1),
+        ];
+        for side in [1024u32, 2048, 4096] {
+            let scale = side * side / (512 * 512);
+            let shaded: u32 = shades.iter().map(|&(_, w)| w * scale).sum();
+            let mut colors = vec![([250, 246, 240, 255], side * side - shaded)];
+            colors.extend(shades.iter().map(|&(c, w)| (c, w * scale)));
+
+            let entries: Vec<HistogramEntry> = colors
+                .iter()
+                .map(|&(color, weight)| HistogramEntry { color, weight })
+                .collect();
+            let root = Cluster::new(entries.iter().collect());
+            assert_eq!(root.mean[3], 255.0);
+            assert_eq!(root.weight, (side * side) as f32);
+            assert_means_within_values(std::slice::from_ref(&root));
+
+            for max_colors in [2, 4, 16, 128, 256] {
+                let clusters = Cluster::new(entries.iter().collect()).split_into(max_colors);
+                assert_means_within_values(&clusters);
+                quantize(&histogram(&colors), max_colors as i32);
+            }
+        }
+    }
+
+    // Random near-uniform histograms of images up to 4096x4096 pixels.
+    #[test]
+    fn near_uniform_random_large() {
+        let mut seed: u64 = 0x1a26e;
+        let mut rand = |n: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as u32) % n
+        };
+
+        for _ in 0..300 {
+            let side = [512, 1024, 2048, 4096][rand(4) as usize];
+            let base = [rand(256) as u8, rand(256) as u8, rand(256) as u8, 255];
+            let mut colors = vec![];
+            let mut shaded = 0;
+            for _ in 0..1 + rand(12) {
+                let mut shade = base;
+                for v in &mut shade {
+                    *v = v.saturating_add_signed(rand(5) as i8 - 2);
+                }
+                let weight = 1 + rand(side);
+                shaded += weight;
+                colors.push((shade, weight));
+            }
+            colors.push((base, side * side - shaded));
+            colors.sort_unstable_by_key(|&(c, _)| c);
+            colors.dedup_by(|a, b| {
+                let same = a.0 == b.0;
+                if same {
+                    b.1 += a.1;
+                }
+                same
+            });
+
+            let entries: Vec<HistogramEntry> = colors
+                .iter()
+                .map(|&(color, weight)| HistogramEntry { color, weight })
+                .collect();
+            let max_colors = [2, 4, 16, 128, 256][rand(5) as usize];
+            let clusters = Cluster::new(entries.iter().collect()).split_into(max_colors);
+            assert_means_within_values(&clusters);
+            quantize(&histogram(&colors), max_colors as i32);
+        }
+    }
+
+    #[test]
+    fn uniform_cluster_is_not_split() {
+        let entries = [HistogramEntry {
+            color: [10, 20, 30, 255],
+            weight: 4096 * 4096,
+        }];
+        let root = Cluster::new(entries.iter().collect());
+        assert_eq!(root.mean, [10.0, 20.0, 30.0, 255.0]);
+        assert_eq!(root.chan_diff, 0.0);
+        assert_eq!(root.split_into(16).len(), 1);
     }
 }
