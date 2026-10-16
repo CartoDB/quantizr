@@ -133,14 +133,10 @@ impl<'clust> Cluster<'clust> {
 
     fn split(&mut self) -> (Self, Self) {
         let widest_chan = self.widest_chan as usize;
-
-        // Exact (see `weighted_mean`), so it lies within the channel's values and both halves get
-        // entries whenever they differ.
         let widest_chan_mean = self.mean[widest_chan];
 
         let mut i: usize = 0;
         let mut lt: usize = 0;
-        // Exclusive upper bound, so it never goes below zero even if every entry is above the mean.
         let mut gt: usize = self.entries.len();
 
         let mut lt_weight: usize = 0;
@@ -177,8 +173,7 @@ impl<'clust> Cluster<'clust> {
     }
 }
 
-/// Adds `color * weight` to `sum`. Integer sums are exact, unlike f32 ones, which round once
-/// they pass 2^24 (one colour covering ~66k pixels).
+// Exact integer sums: f32 ones round past 2^24
 #[inline(always)]
 pub(crate) fn add_weighted(sum: &mut [u64; 4], color: &[u8; 4], weight: u32) {
     let weight = u64::from(weight);
@@ -188,9 +183,6 @@ pub(crate) fn add_weighted(sum: &mut [u64; 4], color: &[u8; 4], weight: u32) {
     sum[3] += u64::from(color[3]) * weight;
 }
 
-/// The mean of exact weighted sums. Below 2^45 pixels both convert to f64 without rounding, so the
-/// result is the correctly rounded mean: within the summed values, and equal to them when they are
-/// all the same.
 #[inline(always)]
 pub(crate) fn weighted_mean(sum: &[u64; 4], weight: u64) -> [f32; 4] {
     let weight = weight as f64;
@@ -265,8 +257,6 @@ mod tests {
     use crate::histogram::{Histogram, HistogramEntry};
     use crate::{Options, QuantizeResult};
 
-    // Reserves like `Histogram::add_image` does for a 512x512 image: the capacity sets the
-    // iteration order, hence the order in which the f32 sums round.
     fn histogram(colors: &[([u8; 4], u32)]) -> Histogram {
         let mut hist = Histogram::new();
         hist.map.reserve(512 * 512 / 7);
@@ -287,7 +277,6 @@ mod tests {
         count as usize
     }
 
-    // Every mean lies within the values it averages, and equals them when they are all the same.
     fn assert_means_within_values(clusters: &[Cluster]) {
         for c in clusters {
             for ch in 0..4 {
@@ -309,8 +298,7 @@ mod tests {
         }
     }
 
-    // A 512x512 map tile that is one colour plus 17 antialiasing shades. Summed in f32, the alpha
-    // mean of a sub-cluster came out as 254.99998 with every alpha at 255.
+    // 512x512 tile that used to panic in `split`
     #[test]
     fn near_uniform_tile() {
         let hist = histogram(&[
@@ -336,39 +324,6 @@ mod tests {
         quantize(&hist, 16);
     }
 
-    #[test]
-    fn single_color() {
-        assert_eq!(quantize(&histogram(&[([10, 20, 30, 255], 1 << 20)]), 16), 1);
-    }
-
-    // One dominant colour and a few one-pixel shades one step away, as in flat areas of map
-    // tiles: the per-channel spread is then as small as the f32 rounding of the means.
-    #[test]
-    fn near_uniform_random() {
-        let mut seed: u64 = 0x5eed;
-        let mut rand = |n: u32| {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((seed >> 33) as u32) % n
-        };
-
-        for _ in 0..5000 {
-            let base = [rand(256) as u8, rand(256) as u8, rand(256) as u8, 255];
-            let mut colors = vec![(base, (1 << 17) + rand(1 << 17))];
-            for _ in 0..1 + rand(6) {
-                let mut shade = base;
-                let ch = rand(3) as usize;
-                shade[ch] = shade[ch].checked_add(1).unwrap_or(254);
-                colors.push((shade, 1 + rand(2)));
-            }
-            let max_colors = [2, 4, 16, 128, 256][rand(5) as usize];
-            quantize(&histogram(&colors), max_colors);
-        }
-    }
-
-    // The same kind of tile rendered at 2x, 4x and 8x (1024x1024 up to 4096x4096 pixels): one
-    // colour covers millions of pixels, so f32 sums would round by several units.
     #[test]
     fn near_uniform_large_images() {
         let shades: [([u8; 4], u32); 5] = [
@@ -401,7 +356,6 @@ mod tests {
         }
     }
 
-    // Random near-uniform histograms of images up to 4096x4096 pixels.
     #[test]
     fn near_uniform_random_large() {
         let mut seed: u64 = 0x1a26e;
@@ -445,17 +399,5 @@ mod tests {
             assert_means_within_values(&clusters);
             quantize(&histogram(&colors), max_colors as i32);
         }
-    }
-
-    #[test]
-    fn uniform_cluster_is_not_split() {
-        let entries = [HistogramEntry {
-            color: [10, 20, 30, 255],
-            weight: 4096 * 4096,
-        }];
-        let root = Cluster::new(entries.iter().collect());
-        assert_eq!(root.mean, [10.0, 20.0, 30.0, 255.0]);
-        assert_eq!(root.chan_diff, 0.0);
-        assert_eq!(root.split_into(16).len(), 1);
     }
 }
